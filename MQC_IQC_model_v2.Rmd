@@ -1,0 +1,197 @@
+---
+title: "MQC_IQC_model"
+author: "Ryuho"
+date: "6/20/2019"
+output: html_document
+---
+
+## モデル式  
+### 状態方程式
+$$
+\alpha _{t+1}=\alpha _{t}+\eta _{\alpha, t} \\
+\gamma _{t+1}=\gamma _{t}+\eta _{\gamma, t} \\
+$$
+
+### 観測方程式
+回帰成分モデル（回帰係数は固定）  
+$y_t$がIQCの時、
+$$
+y_{t}=\alpha _{t}+\beta x_{t} +\varepsilon _{t}
+$$
+$y_t$がMQCの時、
+$$
+y_{t}=\gamma_{t}\left( \alpha _{t}+\beta x_{t}\right) +\varepsilon _{t} \\
+$$
+
+
+
+```{r data}
+library(tidyverse); library(gridExtra); library(rstan)
+set.seed(7)
+
+# 共通の状態成分（ランダムウォーク）
+n_sample <- 200
+a_sd <- 0.1
+a0 <- 5
+state <- a0 + cumsum(rnorm(n_sample, mean=0, sd=a_sd))
+
+# MQCへの変換の係数（ランダムウォーク）
+gamma_mu <- 2.0
+gamma_sd <- 0.02
+gamma_zero <- 1.5
+gamma <- gamma_zero + cumsum(rnorm(n_sample, mean=0.0, sd=gamma_sd))
+# gamma <- 1.5 # fixed coef
+
+# 観測値がIQCかMQCか？ 
+mqc_inerval <- 5 
+is_mqc <- numeric(n_sample)
+is_mqc[seq(1, n_sample, mqc_inerval)] <- 1
+
+# 説明変数
+exog <- matrix(c(rep(1, 50), rep(4, 100), rep(2, 50)))
+beta <- 1.5
+
+# 観測値
+obs_sd <- 0.8
+mqc_error <- rnorm(n = n_sample, sd = obs_sd)
+iqc_error <- rnorm(n = n_sample, sd = obs_sd)
+
+y_iqc <- state + beta * exog + iqc_error
+y_mqc <- gamma * (state + beta * exog) + mqc_error
+
+
+data_org <- data.frame(t=1:n_sample, iqc=y_iqc, mqc=y_mqc, is_mqc=is_mqc, x=exog)
+sim_data <- data_org %>% 
+  mutate(iqc=ifelse(is_mqc, NA, iqc)) %>% 
+  mutate(mqc=ifelse(is_mqc, mqc, NA)) %>% 
+  mutate(y=ifelse(is_mqc, mqc, iqc))
+
+p1 <- ggplot(data=sim_data, aes(x=t, y=iqc)) + 
+  geom_point(size=1) +
+  geom_point(aes(y=mqc), color='red') 
+  # ggsave('mqc_iqc_sim_data.png', width=8, height=4)
+
+p2 <- ggplot(data=sim_data, aes(x=t, y=x)) + 
+  geom_step() # ggsave('mqc_iqc_sim_data.png', width=8, height=4)
+
+p3 <- ggplot(data=sim_data, aes(x=t, y=gamma)) + 
+  geom_line() 
+
+# g <- arrangeGrob(p1, p2, nrow=2) #generates g
+# ggsave('mqc_iqc_sim_data.png', g) #saves g
+grid.arrange(p1, p2, p3)
+```
+
+上から順に、観測値(赤：MQC、黒：IQC）、説明変数、MQCからIQCへの変換の係数（$\gamma_t$）。
+
+```{r}
+root.dir = '/Users/yuho.kida/状態空間モデル/'
+stanmodel <- stan_model(file = file.path(root.dir, 'mqc_iqc_obs.stan'))
+```
+
+Stanでモデル定義。
+```{stan, output.var="stanmodel"}
+
+
+```
+
+
+### MCMC
+```{r}
+# 並列処理を行う
+rstan_options(auto_write=T)
+options(mc.cores = parallel::detectCores())
+
+n_comp1 = sum(!is.na(sim_data$iqc))
+n_comp2 = sum(!is.na(sim_data$mqc))
+
+# データの準備
+stan_data <- list(n = n_sample,
+                  n_comp1 = n_comp1,
+                  n_comp2 = n_comp2,
+                  comp_id1 = which(!is.na(sim_data$iqc)),
+                  comp_id2 = which(!is.na(sim_data$mqc)),
+                  miss_id1 = which(is.na(sim_data$iqc)),
+                  miss_id2 = which(is.na(sim_data$mqc)),
+                  y_comp1 = na.omit(sim_data$iqc),
+                  y_comp2 = na.omit(sim_data$mqc),
+                  y = sim_data$y,
+                  x = sim_data$x,
+                  s_w2 = gamma_sd)
+
+# fit_stan <- sampling(stanmodel, data=stan_data, seed=1, iter=200, chains=1)
+fit_stan <- sampling(stanmodel, 
+                     data=stan_data, 
+                     # init=function() {
+                     #   list(gamma_zero=rnorm(1, mean=1.5, sd=0.1), 
+                     #        s_w2=rgamma(1, shape=20, scale=0.001))
+                     # },
+                     seed=1, 
+                     iter=2000, 
+                     chains=4)
+
+```
+
+```{r}
+select_params <- c("gamma_zero", "mu_zero", "s_w1", "s_v1", "s_v2", "lp__")
+
+print(
+  fit_stan,                       # 推定結果
+  digits = 5,                       # 小数点桁数
+  pars = select_params,   # 表示するパラメタ
+  probs = c(0.025, 0.5, 0.975)      # 区間幅の設定
+)
+
+# トレースプロット
+traceplot(fit_stan, pars = select_params)
+```
+
+
+```{r}
+data.frame.quantile.mcmc <- function(x, y_mcmc, probs=c(2.5, 25, 50, 75, 97.5)/100) {
+  qua <- apply(y_mcmc, 2, quantile, probs=probs)
+  d <- data.frame(t(qua))
+  colnames(d) <- paste0('p', probs*100)
+  return(d)
+}
+
+sampling_result <- rstan::extract(fit_stan)
+
+obs1_pred <- data.frame.quantile.mcmc(sim_data["t"], sampling_result$y1_mean)
+obs2_pred <- data.frame.quantile.mcmc(sim_data["t"], sampling_result$y2_mean)
+colnames(obs1_pred) <- paste0("iqc_", colnames(obs1_pred))
+colnames(obs2_pred) <- paste0("mqc_", colnames(obs2_pred))
+
+res <- cbind(sim_data, obs1_pred, obs2_pred)
+# res_iqc <- res %>% filter(is_mqc == 0)
+# res_mqc <- res %>% filter(is_mqc == 1)
+```
+
+
+```{r}
+ggplot(data=res, aes(x = t, y = iqc)) +
+  geom_point(data=res, alpha=0.8) +
+  geom_line(mapping = aes(y = iqc_p50), color='red') +
+  geom_ribbon(aes(ymin = iqc_p2.5, ymax = iqc_p97.5), fill='red', alpha=0.2) +
+  geom_point(aes(y = mqc), alpha=0.8, color='blue') +
+  geom_line(mapping = aes(y = mqc_p50), color='magenta') +
+  geom_ribbon(aes(ymin = mqc_p2.5, ymax = mqc_p97.5), fill='magenta', alpha=0.2) 
+
+```
+
+MQCの一期先予測を行う。対象時点より前のMQC,IQCデータのみ用いる。
+```{r}
+# 予測対象とするMQC
+pred_id <- which(!is.na(sim_data$mqc))[5]
+
+# 前の時点までのデータを用いる
+sim_data[1:(pred_id-1),]
+
+# モデルのパラメータは全データを用いて算出した値に固定する
+fix_params <- c('beta', 'mu_zero', 'gamma_zero', 's_w1', 's_w2', 's_v1', 's_v2')
+for (p in fix_params) {
+  
+  sampling_result[['p']]
+}
+```
+
